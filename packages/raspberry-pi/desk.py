@@ -11,9 +11,11 @@ import threading
 
 broker = '192.168.2.2'
 port = 1883
+state_topic = "home-assistant/desk/state"
 height_topic = "home-assistant/desk/height"
 height_set_topic = "home-assistant/desk/height/set"
 preset_topic = "home-assistant/desk/command"
+availability_topic = "home-assistant/desk/availability"
 client = None
 # username = 'emqx'
 # password = 'public'
@@ -38,6 +40,8 @@ class LoctekMotion():
     
     previously_published_height = -1
     last_processed = 0
+    last_availability_sent = 0
+    last_sent_state = ""
     currentHeight = 0
 
     def __init__(self, serial, mqtt_client):
@@ -71,28 +75,32 @@ class LoctekMotion():
                 await self.execute_command("wake_up")
             is_showing_target_height = True
             GPIO.setup(23, GPIO.OUT, initial=GPIO.LOW)
-            await asyncio.sleep(0.05)
-            self.serial.write(command)
-            self.serial.write(command)
-            self.serial.write(command)
-            self.serial.write(command)
-            self.serial.write(command)
-            self.serial.write(command)
-            self.serial.write(command)
-            self.serial.write(command)
-            await asyncio.sleep(0.05)
-            self.serial.write(command)
-            self.serial.write(command)
-            self.serial.write(command)
-            self.serial.write(command)
-            self.serial.write(command)
-            self.serial.write(command)
-            self.serial.write(command)
-            self.serial.write(command)
+            await self.send_bytes_over_uart(command)
             print("ran command")
             GPIO.output(23, GPIO.HIGH)
-            x = threading.Thread(target=self.stopped_showing_target_height)
-            x.start()
+            if command_name == "preset_1" or command_name == "preset_2" or command_name == "preset_3" or command_name == "preset_4":
+                x = threading.Thread(target=self.stopped_showing_target_height)
+                x.start()
+
+    async def send_bytes_over_uart(self, bytes):
+        await asyncio.sleep(0.05)
+        self.serial.write(bytes)
+        self.serial.write(bytes)
+        self.serial.write(bytes)
+        self.serial.write(bytes)
+        self.serial.write(bytes)
+        self.serial.write(bytes)
+        self.serial.write(bytes)
+        self.serial.write(bytes)
+        await asyncio.sleep(0.05)
+        self.serial.write(bytes)
+        self.serial.write(bytes)
+        self.serial.write(bytes)
+        self.serial.write(bytes)
+        self.serial.write(bytes)
+        self.serial.write(bytes)
+        self.serial.write(bytes)
+        self.serial.write(bytes)
 
     def stopped_showing_target_height(self):
         global is_showing_target_height
@@ -136,6 +144,9 @@ class LoctekMotion():
 
         history = [None] * 5
         while True:
+            if time.time() - self.last_availability_sent > 10:
+                self.last_availability_sent = time.time()
+                self.mqtt_client.publish(availability_topic, "online", retain=True)
             try:
                 # read in each byte
                 data = self.serial.read(1)
@@ -166,9 +177,21 @@ class LoctekMotion():
                                 print("Height:",finalHeight,"       ",end='\r')
                                 if finalHeight != self.previously_published_height:
                                     if time.time() - self.last_processed > 1:
+                                        if self.previously_published_height > finalHeight:
+                                            self.mqtt_client.publish(state_topic, "closing")
+                                            self.send_state("closing")
+                                        elif self.previously_published_height < finalHeight:
+                                            self.mqtt_client.publish(state_topic, "opening")
+                                            self.send_state("opening")
                                         self.last_processed = time.time()
                                         self.previously_published_height = finalHeight
-                                        self.mqtt_client.publish(height_topic, finalHeight)
+                                        self.mqtt_client.publish(height_topic, finalHeight, retain=True)
+                                elif time.time() - self.last_processed > 1:
+                                    if finalHeight > 100:
+                                        state = "open"
+                                    else:
+                                        state = "closed"
+                                    self.send_state(state)
                 history[4] = history[3]
                 history[3] = history[2]
                 history[2] = history[1]
@@ -179,13 +202,26 @@ class LoctekMotion():
                 print(e)
                 break
 
+    def send_state(self, state):
+        if self.last_sent_state != state:
+            self.last_sent_state = state
+            self.mqtt_client.publish(state_topic, state, retain=True)
+
     def move_to_target(self, target):
-        while(target != self.current_height):
+        delta = abs(target - self.currentHeight)
+
+        if time.time() - self.last_processed > 60*20:
+            asyncio.run(self.execute_command("wake_up"))
+            time.sleep(0.5)
+        GPIO.setup(23, GPIO.OUT, initial=GPIO.LOW)
+        while(delta > .5):
             if target > self.currentHeight:
-                asyncio.run(self.execute_command("up"))
+                asyncio.run(self.send_bytes_over_uart(SUPPORTED_COMMANDS.get("up")))
             elif target < self.currentHeight:
-                asyncio.run(self.execute_command("down"))
-            asyncio.sleep(0.1)
+                asyncio.run(self.send_bytes_over_uart(SUPPORTED_COMMANDS.get("down")))
+            time.sleep(0.01)
+            delta = abs(target - self.currentHeight)
+        GPIO.output(23, GPIO.HIGH)
 
 def connect_mqtt():
     def on_connect(client, userdata, flags, rc):
@@ -228,6 +264,7 @@ def main():
         locktek = LoctekMotion(ser, client)
         x = threading.Thread(target=locktek.current_height)
         x.start()
+        x.join()
     # Error handling for serial port
     except serial.SerialException as e:
         print(e)
