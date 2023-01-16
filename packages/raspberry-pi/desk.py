@@ -33,6 +33,8 @@ SUPPORTED_COMMANDS = {
 class LoctekMotion():
     is_showing_target_height = False
     previously_published_height = -1
+    last_processed = 0
+
     def __init__(self, serial, mqtt_client):
         """Initialize LoctekMotion"""
         self.serial = serial
@@ -52,7 +54,8 @@ class LoctekMotion():
 
         if not command:
             raise Exception("Command not found")
-        if command == "wake_up":
+        if command_name == "wake_up":
+            print("WAKE UP")
             GPIO.setup(24, GPIO.OUT, initial=GPIO.LOW)
             await asyncio.sleep(0.5)
             GPIO.output(24, GPIO.HIGH)
@@ -139,8 +142,10 @@ class LoctekMotion():
                                 finalHeight = finalHeight/10
                             print("Height:",finalHeight,"       ",end='\r')
                             if finalHeight != self.previously_published_height:
-                                self.previously_published_height = finalHeight
-                                self.mqtt_client.publish(height_topic, finalHeight)
+                                if time.time() - self.last_processed > 1:
+                                    self.last_processed = time.time()
+                                    self.previously_published_height = finalHeight
+                                    self.mqtt_client.publish(height_topic, finalHeight)
                 history[4] = history[3]
                 history[3] = history[2]
                 history[2] = history[1]
@@ -161,7 +166,7 @@ def connect_mqtt():
     # Set Connecting Client ID
     client = mqtt.Client("ha-client")
     client.connect(broker)
-    client.username_pw_set(config.mqtt_username, config.mqtt_username)
+    client.username_pw_set(config.mqtt_username, config.mqtt_password)
     client.on_connect = on_connect
     client.loop_start()
     return client
