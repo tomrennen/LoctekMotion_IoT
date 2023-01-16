@@ -7,10 +7,12 @@ import paho.mqtt.client as mqtt
 import paho.mqtt.publish as publish
 import asyncio
 import config
+import threading
 
 broker = '192.168.2.2'
 port = 1883
 height_topic = "home-assistant/desk/height"
+height_set_topic = "home-assistant/desk/height/set"
 preset_topic = "home-assistant/desk/command"
 client = None
 # username = 'emqx'
@@ -30,10 +32,13 @@ SUPPORTED_COMMANDS = {
     "preset_4": bytearray(b'\x9b\x06\x02\x00\x01\xac\x60\x9d'),
 }
 
+is_showing_target_height = False
+
 class LoctekMotion():
-    is_showing_target_height = False
+    
     previously_published_height = -1
     last_processed = 0
+    currentHeight = 0
 
     def __init__(self, serial, mqtt_client):
         """Initialize LoctekMotion"""
@@ -50,6 +55,8 @@ class LoctekMotion():
 
     async def execute_command(self, command_name: str):
         """Execute command"""
+        global is_showing_target_height
+
         command = SUPPORTED_COMMANDS.get(command_name)
 
         if not command:
@@ -57,10 +64,12 @@ class LoctekMotion():
         if command_name == "wake_up":
             print("WAKE UP")
             GPIO.setup(24, GPIO.OUT, initial=GPIO.LOW)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.05)
             GPIO.output(24, GPIO.HIGH)
         else:
-            self.is_showing_target_height = True
+            if time.time() - self.last_processed > 60*20:
+                await self.execute_command("wake_up")
+            is_showing_target_height = True
             GPIO.setup(23, GPIO.OUT, initial=GPIO.LOW)
             await asyncio.sleep(0.05)
             self.serial.write(command)
@@ -82,8 +91,16 @@ class LoctekMotion():
             self.serial.write(command)
             print("ran command")
             GPIO.output(23, GPIO.HIGH)
-            await asyncio.sleep(2.2)
-            self.is_showing_target_height = False
+            x = threading.Thread(target=self.stopped_showing_target_height)
+            x.start()
+
+    def stopped_showing_target_height(self):
+        global is_showing_target_height
+        
+        time.sleep(2.2)
+        print("HIAHOAHUSDOUFHSDSDF")
+        is_showing_target_height = False
+        time.sleep(0.1)
 
     def decode_seven_segment(self, byte):
         binaryByte = bin(byte).replace("0b","").zfill(8)
@@ -115,12 +132,14 @@ class LoctekMotion():
         return -1, decimal
 
     def current_height(self):
+        global is_showing_target_height
+
         history = [None] * 5
         while True:
             try:
                 # read in each byte
                 data = self.serial.read(1)
-                if self.is_showing_target_height:
+                if is_showing_target_height == True:
                     continue
                 # 9b starts the data
                 # the value after 9b has the length of the packet
@@ -140,12 +159,16 @@ class LoctekMotion():
                             decimal = decimal1 or decimal2 or decimal3
                             if decimal == True:
                                 finalHeight = finalHeight/10
-                            print("Height:",finalHeight,"       ",end='\r')
-                            if finalHeight != self.previously_published_height:
-                                if time.time() - self.last_processed > 1:
-                                    self.last_processed = time.time()
-                                    self.previously_published_height = finalHeight
-                                    self.mqtt_client.publish(height_topic, finalHeight)
+                            if finalHeight == 88.8:
+                                print("Display Empty","          ",end='\r')
+                            else:
+                                self.currentHeight = finalHeight
+                                print("Height:",finalHeight,"       ",end='\r')
+                                if finalHeight != self.previously_published_height:
+                                    if time.time() - self.last_processed > 1:
+                                        self.last_processed = time.time()
+                                        self.previously_published_height = finalHeight
+                                        self.mqtt_client.publish(height_topic, finalHeight)
                 history[4] = history[3]
                 history[3] = history[2]
                 history[2] = history[1]
@@ -156,11 +179,19 @@ class LoctekMotion():
                 print(e)
                 break
 
+    def move_to_target(self, target):
+        while(target != self.current_height):
+            if target > self.currentHeight:
+                asyncio.run(self.execute_command("up"))
+            elif target < self.currentHeight:
+                asyncio.run(self.execute_command("down"))
+            asyncio.sleep(0.1)
+
 def connect_mqtt():
     def on_connect(client, userdata, flags, rc):
         if rc == 0:
             print("Connected to MQTT Broker!")
-            subscribe(client, preset_topic, locktek)
+            subscribe(client, [(preset_topic, 0), (height_set_topic, 0)], locktek)
         else:
             print("Failed to connect, return code %d\n", rc)
     # Set Connecting Client ID
@@ -178,8 +209,11 @@ def subscribe(client, topic, locktek):
     def on_message(client, userdata, msg):
         print(f"Received `{msg.payload.decode()}` from `{msg.topic}` topic")
 
-        if topic == preset_topic:
+        if msg.topic == preset_topic:
             asyncio.run(locktek.execute_command(msg.payload.decode()))
+        elif msg.topic == height_set_topic:
+            threading.Thread(target=locktek.move_to_target, args=[float(msg.payload.decode())]).start()
+
 
 
     client.subscribe(topic)
@@ -190,23 +224,14 @@ def main():
     global locktek
     client = connect_mqtt()
     try:
-        # command = sys.argv[1]
         ser = serial.Serial(SERIAL_PORT, 9600, timeout=500)
         locktek = LoctekMotion(ser, client)
-        # locktek.execute_command(command)
-        locktek.current_height()
+        x = threading.Thread(target=locktek.current_height)
+        x.start()
     # Error handling for serial port
     except serial.SerialException as e:
         print(e)
         return
-    # Error handling for command line arguments
-    except IndexError:
-        program = sys.argv[0]
-        print("Usage: python3",program,"[COMMAND]")
-        print("Supported Commands:")
-        for command in SUPPORTED_COMMANDS:
-            print("\t", command)
-        sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(1)
     finally:
